@@ -16,6 +16,7 @@ class RAGSystem:
         self.chunker = DocumentChuncker()
         self.agent_graph = None
         self.thread_id = str(uuid.uuid4())
+        self.recursion_limit = 50
         
     def initialize(self):
         self.vector_db.create_collection(self.collection_name)
@@ -26,7 +27,7 @@ class RAGSystem:
         self.agent_graph = create_agent_graph(llm, tools)
         
     def get_config(self):
-        return {"configurable": {"thread_id": self.thread_id}}
+        return {"configurable": {"thread_id": self.thread_id}, "recursion_limit": self.recursion_limit}
     
     def reset_thread(self):
         try:

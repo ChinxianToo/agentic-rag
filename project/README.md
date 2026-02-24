@@ -32,7 +32,7 @@ The application will be available at `http://localhost:7860` (default Gradio por
 ### Prerequisites
 
 - Python 3.10+
-- Ollama (local) or API keys for OpenAI, Anthropic, or Google Gemini
+- Ollama (local) or API keys for OpenAI, Anthropic, or Google
 
 ---
 
@@ -43,7 +43,7 @@ This system implements an advanced RAG pipeline with the following key features:
 - **Parent-Child Chunking**: Documents are split into small child chunks (for precise retrieval) linked to larger parent chunks (for rich context)
 - **Hybrid Search**: Combines dense embeddings and sparse (BM25) retrieval for optimal results
 - **LangGraph Agent**: Orchestrates query rewriting, retrieval, and response generation
-- **Multi-Provider Support**: Seamlessly switch between Ollama, OpenAI, Google Gemini, and Anthropic Claude
+- **Multi-Provider Support**: Seamlessly switch between Ollama, OpenAI GPT, Google Gemini, and Anthropic Claude
 - **Vector Storage**: Uses Qdrant for efficient similarity search
 
 ### Data Flow
@@ -62,7 +62,7 @@ PDF → Markdown Conversion → Parent/Child Chunking → Vector Indexing → Ag
 |------|---------|
 | `project/app.py` | Application entry point, launches Gradio UI |
 | `project/config.py` | **Central configuration hub** - edit this for provider/model/chunking changes |
-| `project/util.py` | PDF to Markdown conversion using `pymupdf4llm` |
+| `project/utils.py` | PDF to Markdown conversion and context token estimation |
 | `project/document_chunker.py` | Parent/child splitting logic with cleaning and merging rules |
 | `project/Dockerfile` | Dockerfile with Ollama for local deployment |
 
@@ -131,13 +131,24 @@ LLM_MODEL = "qwen3:4b-instruct-2507-q4_K_M"
 LLM_TEMPERATURE = 0  # 0 = deterministic, 1 = creative
 ```
 
+### Agent Configuration
+```python
+# Hard limits to prevent infinite loops
+MAX_TOOL_CALLS = 8       # Maximum tool calls per agent run
+MAX_ITERATIONS = 10      # Maximum agent loop iterations
+
+# Context compression thresholds
+BASE_TOKEN_THRESHOLD = 2000     # Initial token threshold for compression
+TOKEN_GROWTH_FACTOR = 0.9       # Multiplier applied after each compression
+```
+
 ### Text Splitter Configuration
 
 ```python
 CHILD_CHUNK_SIZE = 500              # Size of chunks used for retrieval
 CHILD_CHUNK_OVERLAP = 100           # Overlap between chunks (prevents context loss)
 MIN_PARENT_SIZE = 2000              # Minimum parent chunk size
-MAX_PARENT_SIZE = 10000             # Maximum parent chunk size
+MAX_PARENT_SIZE = 4000             # Maximum parent chunk size
 
 # Markdown header splitting strategy
 HEADERS_TO_SPLIT_ON = [
@@ -153,7 +164,7 @@ HEADERS_TO_SPLIT_ON = [
 
 ### 1. Switching LLM Provider (Single Provider)
 
-> **Performance Note:** LLMs with ≥14B parameters typically offer superior reasoning, context comprehension, and response quality compared to smaller models. This applies to both proprietary and open-source models, as long as they **support native tool/function calling,** which is required for agentic RAG workflows.
+> **Performance Note:** LLMs with 7B+ parameters typically offer superior reasoning, context comprehension, and response quality compared to smaller models. This applies to both proprietary and open-source models, as long as they **support native tool/function calling,** which is required for agentic RAG workflows.
 
 If you want to permanently switch from one provider to another (e.g., Ollama → Google Gemini), follow this steps:
 
@@ -192,7 +203,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 llm = ChatGoogleGenerativeAI(model=config.LLM_MODEL, temperature=config.LLM_TEMPERATURE)
 ```
 
-## 2. Multi-Provider Configuration
+### 2. Multi-Provider Configuration
 
 This approach allows you to maintain multiple provider configurations and switch between them easily.
 
@@ -216,16 +227,16 @@ export GOOGLE_API_KEY="your-google-key"
 # --- Multi-Provider LLM Configuration ---
 LLM_CONFIGS = {
     "ollama": {
-        "model": "llama3.2:3b",
-        "url":"http://localhost:11434"
+        "model": "ministral-3:14b-instruct-2512-q4_K_M",
+        "url":"http://localhost:11434",
         "temperature": 0
     },
     "openai": {
-        "model": "gpt-4o",
+        "model": "gpt-5.2",
         "temperature": 0
     },
     "anthropic": {
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-sonnet-4-6",
         "temperature": 0
     },
     "google": {
@@ -252,24 +263,24 @@ def initialize(self):
     model = active_config["model"]
     temperature = active_config["temperature"]
     
-    if active_config == "ollama":
+    if config.ACTIVE_LLM_CONFIG == "ollama":
         from langchain_ollama import ChatOllama
         llm = ChatOllama(model=model, temperature=temperature, base_url=active_config["url"])
         
-    elif active_config == "openai":
+    elif config.ACTIVE_LLM_CONFIG == "openai":
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(model=model, temperature=temperature)
         
-    elif active_config == "anthropic":
+    elif config.ACTIVE_LLM_CONFIG == "anthropic":
         from langchain_anthropic import ChatAnthropic
         llm = ChatAnthropic(model=model, temperature=temperature)
         
-    elif active_config == "google":
+    elif config.ACTIVE_LLM_CONFIG == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
         llm = ChatGoogleGenerativeAI(model=model, temperature=temperature)
         
     else:
-        raise ValueError(f"Unsupported LLM provider: {active_config}")
+        raise ValueError(f"Unsupported LLM provider: {config.ACTIVE_LLM_CONFIG}")
     
     # Continue with tool and graph initialization
     tools = ToolFactory(collection).create_tools()
@@ -290,14 +301,14 @@ ACTIVE_LLM_CONFIG = "google"  # Switch to Gemini Pro
 
 | Provider | Environment Variable | Import Statement | Example Models |
 |----------|---------------------|------------------|----------------|
-| OpenAI | `OPENAI_API_KEY` | `from langchain_openai import ChatOpenAI` | `gpt-4o`, `gpt-4o-mini` |
-| Anthropic | `ANTHROPIC_API_KEY` | `from langchain_anthropic import ChatAnthropic` | `claude-opus-4-20250514`, `claude-sonnet-4-20250514` |
+| OpenAI | `OPENAI_API_KEY` | `from langchain_openai import ChatOpenAI` | `gpt-5.2`, `ggpt-5-mini` |
+| Anthropic | `ANTHROPIC_API_KEY` | `from langchain_anthropic import ChatAnthropic` | `claude-opus-4-6`, `claude-sonnet-4-6` |
 | Google | `GOOGLE_API_KEY` | `from langchain_google_genai import ChatGoogleGenerativeAI` | `gemini-2.5-pro`, `gemini-2.5-flash` |
 | Ollama | None (local) | `from langchain_ollama import ChatOllama` | `qwen3:4b-instruct-2507-q4_K_M`, `ministral-3:8b-instruct-2512-q4_K_M`, `llama3.1:8b-instruct-q6_K` |
 
 ---
 
-### 2. Changing Embedding Models
+### 3. Changing Embedding Models
 
 **Why change?** Trade-offs between speed, cost, and quality.
 
@@ -338,15 +349,15 @@ self.__sparse_embeddings = FastEmbedSparse(model_name=config.SPARSE_MODEL)
 
 | Model | Context Size | Vector Dimension | Speed | Quality | Use Case |
 |-------|--------------|------------------|-------|---------|----------|
-| all-MiniLM-L6-v2 | 512 tokens | 384 | Fast | Good | General purpose, quick semantic similarity |
+| all-MiniLM-L6-v2 | 256 tokens | 384 | Fast | Good | General purpose, quick semantic similarity |
 | all-mpnet-base-v2 | 512 tokens | 768 | Medium | Excellent | High-accuracy semantic search |
 | bge-large-en-v1.5 | 512 tokens | 1024 | Slow | Best | Production-grade retrieval on GPU |
-| google/embeddinggemma-300m | 2048 tokens | 768 (MRL: 512 / 256 / 128) | Fast | Very Good | Lightweight, efficient multilingual retrieval |
-| Qwen/Qwen3-Embedding-8B | 32768 tokens | 4096 (configurable 32–4096) | Medium | Excellent / SOTA | Large-scale multilingual embeddings, long-context RAG |
+| google/embeddinggemma-300m | 2048 tokens | 768 | Fast | Very Good | Lightweight, efficient multilingual retrieval |
+| Qwen/Qwen3-Embedding-8B | 32768 tokens | 4096 | Slow | Excellent / SOTA | Large-scale multilingual embeddings, long-context RAG |
 
 ---
 
-### 3. Adjusting Chunking Strategy
+### 4. Adjusting Chunking Strategy
 
 **Why adjust?** Balance between retrieval precision and context richness.
 
@@ -361,7 +372,7 @@ MAX_PARENT_SIZE = 8000
 
 # For narrative or contextual queries (e.g., legal documents)
 # CHILD_CHUNK_SIZE = 800
-# CHILD_CHUNK_OVERLAP = 100
+# CHILD_CHUNK_OVERLAP = 150
 # MIN_PARENT_SIZE = 3000
 # MAX_PARENT_SIZE = 15000
 ```
@@ -394,14 +405,40 @@ Upload documents again through the Gradio interface to apply new chunking.
 
 **Chunking Guidelines:**
 
+> ⚠️ **Disclaimer:** These are empirical guidelines. Optimal sizes depend on:
+> - **Child chunk** → embedding model's context window (e.g. 256 tokens for all-MiniLM-L6-v2, 512 for bge-large-en-v1.5): child size should not exceed it
+> - **Parent chunk** → generative model's context window (e.g. 8K, 32K, 128K tokens): parent must fit within the context sent to the LLM alongside the query
+>
+> Always validate values empirically on your own corpus.
+
 | Document Type | Child Size | Parent Size | Reasoning |
 |---------------|-----------|-------------|-----------|
-| Technical Docs | 300-500 | 2000-5000 | Precise lookups, code snippets |
+| Technical Docs | 300-500 | 2000-4000 | Precise lookups, code snippets |
 | Legal Contracts | 600-1000 | 5000-15000 | Context-heavy, definitions |
 | Research Papers | 400-600 | 3000-8000 | Balance of precision and context |
 | FAQs / Knowledge Base | 200-400 | 1500-4000 | Short, focused answers |
 
 ---
+
+### 5. Agent Configuration
+
+Tune agent behavior in `project/config.py`:
+```python
+# Hard limits to prevent infinite loops
+MAX_TOOL_CALLS = 8       # Maximum tool calls per agent run
+MAX_ITERATIONS = 10      # Maximum agent loop iterations
+
+# Context compression thresholds
+BASE_TOKEN_THRESHOLD = 2000     # Initial token threshold for compression
+TOKEN_GROWTH_FACTOR = 0.9       # Multiplier applied after each compression
+```
+
+| Parameter | Effect |
+|-----------|--------|
+| `MAX_TOOL_CALLS` | Increase for complex queries, decrease to speed up simple ones |
+| `MAX_ITERATIONS` | Controls how many reasoning loops the agent can run |
+| `BASE_TOKEN_THRESHOLD` | Delay compression by increasing this value |
+| `TOKEN_GROWTH_FACTOR` | Lower values compress more aggressively |
 
 ## Advanced Topics
 
@@ -427,14 +464,14 @@ builder.add_edge("retrieve", "fact_check")
 
 Example from the system - routing based on query clarity:
 ```python
-def route_after_rewrite(state: State) -> Literal["human_input", "process_question"]:
+def route_after_rewrite(state: State) -> Literal["request_clarification", "agent"]:
     """Routes to human input if question unclear, otherwise processes all rewritten queries"""
     if not state.get("questionIsClear", False):
-        return "human_input"
+        return "request_clarification"
     else:
         # Fan-out: send each rewritten question to parallel processing
         return [
-            Send("process_question", {"question": query, "question_index": idx, "messages": []})
+            Send("agent", {"question": query, "question_index": idx, "messages": []})
             for idx, query in enumerate(state["rewrittenQuestions"])
         ]
 ```
@@ -472,18 +509,33 @@ with gr.Accordion("Advanced Settings", open=False):
 
 ### Docker Deployment
 
-Build and run with Docker:
+> ⚠️ **System Requirements**: At least 8GB of RAM allocated to Docker. The default Ollama model needs approximately 3.3GB to run.
 
+#### Build and Run
 ```bash
 # Build image
-docker build -t rag-system -f project/Dockerfile .
+docker build -t agentic-rag -f project/Dockerfile .
 
 # Run container
-docker run -p 7860:7860 \
-  -e OPENAI_API_KEY=your-key \
-  -v $(pwd)/data:/app/data \
-  rag-system
+docker run --name rag-assistant -p 7860:7860 agentic-rag
 ```
+
+**Optional: GPU acceleration** (NVIDIA only):
+```bash
+docker run --gpus all --name rag-assistant -p 7860:7860 agentic-rag
+```
+
+**Common commands:**
+```bash
+docker stop rag-assistant      # Stop
+docker start rag-assistant     # Restart
+docker logs -f rag-assistant   # View logs
+docker rm -f rag-assistant     # Remove
+```
+
+> ⚠️ **Performance Note**: On Windows/Mac, Docker runs via a Linux VM which may slow down I/O operations like document indexing. LLM inference speed is largely unaffected. On Linux, performance is comparable to running locally.
+
+Once running, open `http://localhost:7860`.
 
 ### Performance Optimization
 
