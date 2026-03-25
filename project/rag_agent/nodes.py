@@ -1,11 +1,91 @@
+import re
 from typing import Literal, Set
 from langchain_core.messages import SystemMessage, HumanMessage, RemoveMessage, AIMessage, ToolMessage
+from langgraph.graph import END
 from langgraph.types import Command
 from .graph_state import State, AgentState
 from .schemas import QueryAnalysis
 from .prompts import *
 from utils import estimate_context_tokens
 from config import BASE_TOKEN_THRESHOLD, TOKEN_GROWTH_FACTOR
+
+# ---------------------------------------------------------------------------
+# Domain guard — fast, no-LLM pre-flight checks (runs before ANY LLM call).
+# Handles two cases:
+#   1. Off-topic query → polite refusal explaining what the bot covers.
+#   2. Out-of-range year → immediate "data not available" without touching the LLM.
+# ---------------------------------------------------------------------------
+_DOMAIN_KEYWORDS: frozenset[str] = frozenset([
+    # Dataset / source
+    "cpi", "consumer price", "price index", "inflation", "dosm", "opendosm",
+    # Geography
+    "malaysia", "malaysian",
+    # Time-related (years covered by the dataset)
+    "annual", "yearly", "year", "1960", "1970", "1980", "1990", "2000",
+    "2010", "2011", "2012", "2013", "2014", "2015", "2016", "2017", "2018",
+    "2019", "2020", "2021", "2022", "2023", "2024", "2025",
+    # COICOP divisions & common aliases
+    "overall", "division", "food", "beverage", "f&b", "fnb",
+    "alcohol", "tobacco", "clothing", "footwear", "housing", "water",
+    "electricity", "furnishing", "household", "health", "transport",
+    "communication", "recreation", "culture", "education",
+    "restaurant", "hotel", "miscellaneous",
+    # Generic stat terms
+    "index", "value", "statistic", "compare", "trend", "change", "growth",
+    "increase", "decrease", "rise", "fall", "rate",
+])
+
+# Inclusive year range of the indexed dataset (update if you re-ingest with more data).
+_DATASET_MIN_YEAR = 1960
+_DATASET_MAX_YEAR = 2025
+
+_REFUSAL_MSG = (
+    "I can only answer questions about Malaysia's **Consumer Price Index (CPI)** data "
+    "from the DOSM annual dataset (OpenDOSM). Your question appears to be outside that scope.\n\n"
+    "Here are some things I *can* help with:\n"
+    "- *What was the overall CPI in 2020?*\n"
+    "- *Compare food & beverage CPI between 2015 and 2022.*\n"
+    "- *Which division had the highest CPI growth from 2010 to 2024?*\n"
+    "- *Show me the transport CPI trend from 2000 onwards.*"
+)
+
+
+def _extract_years(text: str) -> list[int]:
+    """Extract 4-digit years from query text."""
+    return [int(y) for y in re.findall(r"\b(1[0-9]{3}|2[0-9]{3})\b", text)]
+
+
+def domain_guard(state: State) -> Command[Literal["rewrite_query", "__end__"]]:
+    """Fast (no-LLM) domain + year-range guard. Short-circuits before any LLM call."""
+    last = state["messages"][-1]
+    text = (last.content or "").lower()
+
+    # 1. Off-topic: no domain keywords present → refuse
+    if not any(kw in text for kw in _DOMAIN_KEYWORDS):
+        return Command(
+            update={"messages": [AIMessage(content=_REFUSAL_MSG)]},
+            goto=END,
+        )
+
+    # 2. Year-range: query explicitly mentions a year outside the dataset
+    years = _extract_years(text)
+    out_of_range = [y for y in years if y > _DATASET_MAX_YEAR or y < _DATASET_MIN_YEAR]
+    if out_of_range:
+        oor_str = ", ".join(str(y) for y in sorted(set(out_of_range)))
+        msg = (
+            f"The indexed dataset covers **{_DATASET_MIN_YEAR}-{_DATASET_MAX_YEAR}** only. "
+            f"Data for **{oor_str}** is not available in the current extract.\n\n"
+            f"The most recent year available is **{_DATASET_MAX_YEAR}**. "
+            f"You can ask about any year between {_DATASET_MIN_YEAR} and {_DATASET_MAX_YEAR}."
+        )
+        return Command(
+            update={"messages": [AIMessage(content=msg)]},
+            goto=END,
+        )
+
+    # 3. In-scope, in-range → proceed to LLM pipeline
+    return Command(goto="rewrite_query")
+
 
 def summarize_history(state: State, llm):
     if len(state["messages"]) < 4:
@@ -92,6 +172,58 @@ def fallback_response(state: AgentState, llm):
     )
     response = llm.invoke([SystemMessage(content=get_fallback_response_prompt()), HumanMessage(content=prompt_content)])
     return {"messages": [response]}
+
+
+def _latest_tool_messages_after_last_ai(messages) -> list:
+    """ToolMessages following the most recent AIMessage that requested tools."""
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            tail = []
+            for j in range(i + 1, len(messages)):
+                if isinstance(messages[j], ToolMessage):
+                    tail.append(messages[j])
+                elif isinstance(messages[j], AIMessage):
+                    break
+            return tail
+    return []
+
+
+def _is_low_confidence_search(content: str) -> bool:
+    if not content or not content.strip():
+        return True
+    if "NO_RELEVANT_CHUNKS" in content:
+        return True
+    if content.strip().startswith("<<<RETRIEVAL_STATUS:LOW_CONFIDENCE"):
+        return True
+    return False
+
+
+def retrieval_guard(state: AgentState) -> Command[Literal["should_compress_context", "low_confidence_response"]]:
+    """Route low-confidence retrieval to a dedicated clarify/refuse node (LangGraph guardrail)."""
+    tail = _latest_tool_messages_after_last_ai(state["messages"])
+    for msg in tail:
+        if not isinstance(msg, ToolMessage):
+            continue
+        name = getattr(msg, "name", "") or ""
+        if name == "retrieve_parent_chunks":
+            continue
+        if name == "search_child_chunks" or "<<<RETRIEVAL_STATUS:" in (msg.content or ""):
+            if _is_low_confidence_search(msg.content or ""):
+                return Command(goto="low_confidence_response")
+    return Command(goto="should_compress_context")
+
+
+def low_confidence_response(state: AgentState, llm):
+    tail = _latest_tool_messages_after_last_ai(state["messages"])
+    tool_blob = "\n".join((m.content or "") for m in tail if isinstance(m, ToolMessage))
+    q = state.get("question", "")
+    response = llm.invoke([
+        SystemMessage(content=get_low_confidence_prompt()),
+        HumanMessage(content=f"User question:\n{q}\n\nRetrieval output:\n{tool_blob}"),
+    ])
+    return {"messages": [response]}
+
 
 def should_compress_context(state: AgentState) -> Command[Literal["compress_context", "orchestrator"]]:
     messages = state["messages"]

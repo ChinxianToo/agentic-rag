@@ -64,6 +64,8 @@ PDF → Markdown Conversion → Parent/Child Chunking → Vector Indexing → Ag
 | `project/config.py` | **Central configuration hub** - edit this for provider/model/chunking changes |
 | `project/utils.py` | PDF to Markdown conversion and context token estimation |
 | `project/document_chunker.py` | Parent/child splitting logic with cleaning and merging rules |
+| `project/cpi_document_builder.py` | CPI CSV → row-level child docs + division-level parent series (tabular chunking) |
+| `project/ingest_cpi.py` | CLI: embed CPI into Qdrant + `parent_store` |
 | `project/Dockerfile` | Dockerfile with Ollama for local deployment |
 
 ### Core System
@@ -157,6 +159,39 @@ HEADERS_TO_SPLIT_ON = [
     ("###", "H3")
 ]
 ```
+
+### DOSM CPI (tabular) — ingestion & chunking
+
+For **`parent_store/CPI 2D Annual.csv`** (and similar long-format CPI tables), **do not** run the Markdown parent/child splitter on raw CSV text: fixed-size recursive splits break rows and mix unrelated years/divisions.
+
+**Recommended strategy (implemented in `cpi_document_builder.py`):**
+
+| Piece | Strategy |
+|--------|----------|
+| **Child chunks (embedded)** | **One CSV row → one document.** Each row is turned into a short **natural-language fact** (division, year, index) so dense + BM25 retrieval can match questions like “CPI for food in 2010”. |
+| **Parent chunks (parent_store)** | **One document per `division`** (including `overall`): the **full available annual series** for that division as `year: index` lines, for `retrieve_parent_chunks` when the agent needs trend context. |
+| **Overlap / window** | **None** at row level (each row is atomic). Series context is in the **parent**, not overlapping windows. |
+| **Embeddings** | Same as the rest of the app: **`DENSE_MODEL`** in `config.py` (default **Ollama `nomic-embed-text`**). Changing the embedding model requires re-running ingestion. |
+| **Vector store** | **Qdrant** hybrid (`QdrantVectorStore` + `FastEmbedSparse`), collection `CHILD_COLLECTION`. |
+| **Retrieval `k`** | Set in the agent tool call (default in `search_child_chunks`); treat **5–10** as a reasonable starting range for CPI Q&A. |
+
+**Run ingestion (clean index):**
+
+```bash
+# From repo root (requires Ollama + embedding model, and Qdrant per config)
+python project/ingest_cpi.py --reset
+```
+
+`--reset` deletes the configured Qdrant collection, recreates it, **clears `parent_store`**, then indexes CPI. Back up `parent_store` first if it contains non-CPI parents.
+
+**CSV location:** `parent_store/` is **gitignored**, so a fresh clone has no CSV until you add one. Put the file at `project/parent_store/CPI 2D Annual.csv`, or **`project/data/cpi_2d_annual.csv`** (tracked if you commit it), or pass `--csv /path/to/file.csv`. The ingest script resolves the first path that exists.
+
+### Phase 3 — RAG answers, citations, low-confidence (LangGraph)
+
+- **Retrieval:** `search_child_chunks` uses `similarity_search_with_relevance_scores`, returns **`<<<RETRIEVAL_STATUS:OK|top_score=...>>>`** plus numbered lines with **relevance**, **source**, **division**, **year**, **parent_id**, and **Content** for inline citations.
+- **Answering:** Orchestrator / fallback prompts require **inline citations** (file, division, year, `[n]`) and a final **Sources** list (including `.csv`).
+- **Low confidence:** If there are no hits, **top similarity** is below `RETRIEVAL_MIN_TOP_SCORE`, or (when `RETRIEVAL_LEXICAL_OVERLAP_CHECK` is on) the query has **no lexical overlap** with the top hit, the subgraph routes **`tools` → `retrieval_guard` → `low_confidence_response` → `collect_answer`** instead of looping compression/orchestrator — clarifying question or polite refusal via `get_low_confidence_prompt()`.
+- **Tune:** `RETRIEVAL_MIN_TOP_SCORE`, `RETRIEVAL_SCORE_THRESHOLD`, `RETRIEVAL_LEXICAL_OVERLAP_CHECK` in `project/config.py`.
 
 ---
 

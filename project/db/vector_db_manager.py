@@ -1,16 +1,19 @@
 import config
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore, FastEmbedSparse, RetrievalMode
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 class VectorDbManager:
     __client: QdrantClient
-    __dense_embeddings: HuggingFaceEmbeddings
+    __dense_embeddings: OllamaEmbeddings
     __sparse_embeddings: FastEmbedSparse
     def __init__(self):
-        self.__client = QdrantClient(path=config.QDRANT_DB_PATH)
-        self.__dense_embeddings = HuggingFaceEmbeddings(model_name=config.DENSE_MODEL)
+        if getattr(config, "QDRANT_URL", None):
+            self.__client = QdrantClient(url=config.QDRANT_URL)
+        else:
+            self.__client = QdrantClient(path=config.QDRANT_DB_PATH)
+        self.__dense_embeddings = OllamaEmbeddings(model=config.DENSE_MODEL)
         self.__sparse_embeddings = FastEmbedSparse(model_name=config.SPARSE_MODEL)
 
     def create_collection(self, collection_name):
