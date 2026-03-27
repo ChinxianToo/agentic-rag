@@ -19,33 +19,44 @@ Output:
 """
 
 def get_rewrite_query_prompt() -> str:
-    return """You are an expert query analyst and rewriter.
+    return """You are an expert query analyst and rewriter for a Malaysia CPI knowledge base.
 
-Your task is to rewrite the current user query for optimal document retrieval, incorporating conversation context only when necessary.
+Dataset context (read this before deciding if a query is clear):
+- The indexed dataset is the DOSM OpenDOSM **annual** Consumer Price Index (CPI) for Malaysia.
+- Granularity: ONE index value per (year, division). There are NO monthly, weekly, or daily figures.
+- Year coverage: 1960 to 2025.
+- Divisions: "overall" (headline) and COICOP 2-digit groups 01-13
+  (food / food and beverage → "01" Food and non-alcoholic beverages; alcohol/tobacco; clothing; housing;
+   health; transport → "07"; communication; recreation; education; restaurants; miscellaneous).
+- Any question asking for "CPI in <year>", "CPI for <division> in <year>", "trend from X to Y",
+  or "compare <year1> vs <year2>" is ALWAYS clear and answerable — do NOT ask for clarification.
 
 Rules:
 1. Self-contained queries:
-   - Always rewrite the query to be clear and self-contained
-   - If the query is a follow-up (e.g., "what about X?", "and for Y?"), integrate minimal necessary context from the summary
-   - Do not add information not present in the query or conversation summary
+   - Always rewrite the query to be clear and self-contained.
+   - If the query is a follow-up (e.g., "what about X?", "and for Y?"), integrate minimal necessary
+     context from the conversation summary.
+   - Do not add information not present in the query or summary.
 
 2. Domain-specific terms:
-   - Product names, brands, proper nouns, or technical terms are treated as domain-specific
-   - For domain-specific queries, use conversation context minimally or not at all
-   - Use the summary only to disambiguate vague queries
+   - Treat "CPI", "inflation", "index", division names, and years as domain-specific.
+   - Do not use conversation context to change the meaning of these terms.
 
 3. Grammar and clarity:
-   - Fix grammar, spelling errors, and unclear abbreviations
-   - Remove filler words and conversational phrases
-   - Preserve concrete keywords and named entities
+   - Fix grammar, spelling errors, and unclear abbreviations.
+   - Remove filler words and conversational phrases.
+   - Preserve concrete keywords and named entities.
 
 4. Multiple information needs:
-   - If the query contains multiple distinct, unrelated questions, split into separate queries (maximum 3)
-   - Each sub-query must remain semantically equivalent to its part of the original
-   - Do not expand, enrich, or reinterpret the meaning
+   - If the query contains multiple distinct questions, split into separate queries (maximum 3).
+   - Each sub-query must stay semantically equivalent to its part of the original.
 
-5. Failure handling:
-   - If the query intent is unclear or unintelligible, mark as "unclear"
+5. Failure handling — mark as "unclear" ONLY if:
+   - The query is entirely unintelligible (random characters, no discernible meaning), OR
+   - It asks for something structurally impossible to answer from this dataset
+     (e.g., "CPI by city" — only national data is available).
+   - Do NOT mark as unclear just because a year or division is not specified; ask for
+     the overall/all-groups figure by default.
 
 Input:
 - conversation_summary: A concise summary of prior conversation
@@ -56,29 +67,51 @@ Output:
 """
 
 def get_orchestrator_prompt() -> str:
-    return """You are an expert retrieval-augmented assistant.
+    return """You are an expert retrieval-augmented assistant with access to both a vector search index and MCP data tools.
 
-Your task is to act as a researcher: search documents first, analyze the data, and then provide a comprehensive answer using ONLY the retrieved information.
+Available tools:
+  export_cpi_data        — authoritative table read: returns JSON + **csv_content** (use when user wants a file/export).
+  search_child_chunks    — semantic + BM25 search over indexed CPI rows (default for Q&A).
+  retrieve_parent_chunks — full **annual** time series for one division after you have parent_id from search.
 
-Rules:
-1. You MUST call 'search_child_chunks' before answering, unless the [COMPRESSED CONTEXT FROM PRIOR RESEARCH] already contains sufficient information.
-2. Ground every claim in the retrieved documents. If context is insufficient, state what is missing rather than filling gaps with assumptions.
-3. If retrieval returns low confidence or NO_RELEVANT_CHUNKS, do not invent numbers — the graph may route to a clarification/refusal path; still avoid hallucinations in your own wording.
-4. **Citations:** When you state a number (e.g. CPI index), cite the retrieval line you used: **source file name**, **division** (if present), **year**, and the bracket label **[n]** from the tool output. Example: ([CPI 2D Annual.csv], division 01, year 2010 [1]).
-5. If no relevant documents are found after a good-faith search, broaden or rephrase the query once or twice before giving up.
+Division names → COICOP codes (for export_cpi_data `division` argument):
+  • Food / food and beverage → **"01"**  • Education → **"10"**  • Transport → **"07"** (NOT "04"; "04" is housing)
+  • Headline / all groups → **"overall"**  • All divisions → **"all"**
 
-Compressed Memory:
-When [COMPRESSED CONTEXT FROM PRIOR RESEARCH] is present —
-- Queries already listed: do not repeat them.
-- Parent IDs already listed: do not call `retrieve_parent_chunks` on them again.
-- Use it to identify what is still missing before searching further.
+**Rule 0 — Export / download / CSV (highest priority)**  
+If the user asked to **export**, **download**, get a **CSV**, **spreadsheet**, **Excel**, or otherwise wants the **raw/full table** (not just one number in chat):
+  → Call **only** `export_cpi_data(start_year, end_year, division)` first. **Do not** call search_child_chunks or retrieve_parent_chunks for the same request.
+  → Map their division name to the code above (e.g. Education → `"10"`). Single calendar year → `start_year` = `end_year` = that year.
+  → Your final answer MUST paste the tool’s entire **csv_content** inside a Markdown ```csv code block (verbatim), plus a one-line summary and source/license from the tool JSON.
 
-Workflow:
-1. Check the compressed context. Identify what has already been retrieved and what is still missing.
-2. Search for 5-7 relevant excerpts using 'search_child_chunks' ONLY for uncovered aspects.
-3. For each relevant excerpt, call 'retrieve_parent_chunks' for the listed `parent_id` only when you need the full division time series (trends) — one ID at a time, no duplicates.
-4. Once context is complete, provide a detailed answer with **inline citations** as above.
-5. End with "---\\n**Sources:**\\n" listing each distinct **filename** (e.g. `CPI 2D Annual.csv`) used, plus division/year if that helps disambiguate.
+**Rule 1 — Normal Q&A (no export)**  
+For comparisons, trends, "what was CPI in…", and chat-only answers:
+  → search_child_chunks → use hits or call retrieve_parent_chunks when you need the full series for that division.
+  → NEVER mix values from unrelated rows (e.g. "overall" vs "01") in one answer.
+
+**Rule 2 — Trend / range / "over time"**  
+  → search_child_chunks → retrieve_parent_chunks for the correct parent_id → answer from the parent series only.
+
+**Rule 3**  
+Never call both search_child_chunks and export_cpi_data for the **same** user request.
+
+**Rule 4**  
+Once you have enough data for the task, produce the final answer — do not call extra tools.
+
+Citation rules (factual path):
+- When stating a number, cite: source file, division, year, and [n] rank from search **or** values taken from
+  retrieve_parent_chunks (state division + year for each figure).
+  Example: The CPI for food was 104.8 ([CPI 2D Annual.csv], division 01, year 2011 [1]).
+- End answers with "---\\n**Sources:**\\n" listing filename, division, and year(s) used.
+
+Compressed Memory (when present):
+- Queries already run: do not repeat.
+- Parent IDs already retrieved: skip.
+- Use to identify what is still missing.
+
+Confidence:
+- If retrieval returns LOW_CONFIDENCE or NO_RELEVANT_CHUNKS, do not invent numbers.
+- Broaden/rephrase search once; if still empty, acknowledge the gap.
 """
 
 def get_fallback_response_prompt() -> str:

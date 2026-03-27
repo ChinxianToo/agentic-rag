@@ -1,0 +1,37 @@
+# Version control
+.git
+.gitignore
+
+# Virtual environment
+.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE / editor
+.cursor
+.vscode
+*.swp
+*.swo
+
+# Local data (mounted at runtime, not baked into image)
+project/parent_store/
+project/qdrant_db/
+
+# Secrets (passed via env_file at runtime)
+project/.env
+.env
+
+# Docs and notebooks
+*.md
+*.ipynb
+
+# Test artifacts
+.pytest_cache
+htmlcov/
+.coverage

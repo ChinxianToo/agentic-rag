@@ -2,8 +2,6 @@ import uuid
 from langchain_openrouter import ChatOpenRouter
 import config
 from db.vector_db_manager import VectorDbManager
-from db.parent_store_manager import ParentStoreManager
-from document_chunker import DocumentChuncker
 from rag_agent.tools import ToolFactory
 from rag_agent.graph import create_agent_graph
 
@@ -12,8 +10,6 @@ class RAGSystem:
     def __init__(self, collection_name=config.CHILD_COLLECTION):
         self.collection_name = collection_name
         self.vector_db = VectorDbManager()
-        self.parent_store = ParentStoreManager()
-        self.chunker = DocumentChuncker()
         self.agent_graph = None
         self.thread_id = str(uuid.uuid4())
         self.recursion_limit = 50

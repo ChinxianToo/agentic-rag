@@ -1,34 +1,35 @@
-FROM python:3.13
-ENV PYTHONUNBUFFERED=1
-ENV OLLAMA_HOST=0.0.0.0:11434
-ENV GRADIO_SERVER_NAME=0.0.0.0
-ENV GRADIO_SERVER_PORT=7860
+FROM python:3.13-slim
 
-RUN apt-get update && apt-get install -y \
-    curl \
-    ca-certificates \
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# System deps (curl needed by entrypoint health checks)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://ollama.com/install.sh | sh
-RUN useradd -m -u 1000 user
-USER user
-ENV PATH="/home/user/.local/bin:$PATH"
+
+# Non-root user
+RUN useradd -m -u 1000 appuser
 WORKDIR /app
-COPY --chown=user requirements.txt .
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
-COPY --chown=user . .
-USER root
-COPY <<EOF /app/start.sh
-#!/bin/bash
-ollama serve &
-echo "Waiting for Ollama to start..."
-sleep 5
-echo "Downloading model qwen3:4b-instruct-2507-q4_K_M..."
-ollama pull qwen3:4b-instruct-2507-q4_K_M
-echo "Starting application on port 7860..."
-cd project
-python app.py
-EOF
-RUN chmod +x /app/start.sh && chown user:user /app/start.sh
-USER user
-EXPOSE 7860
-CMD ["/app/start.sh"]
+
+# Install Python dependencies first (layer-cached unless requirements change)
+COPY --chown=appuser requirements.txt .
+RUN pip install --upgrade pip \
+ && pip install -r requirements.txt
+
+# Copy application source
+COPY --chown=appuser project/ ./project/
+COPY --chown=appuser docker-entrypoint.sh .
+RUN chmod +x docker-entrypoint.sh
+
+# Pre-create volume mount points as appuser so Docker initialises the
+# named volumes with the correct ownership on first mount.
+RUN mkdir -p /app/project/parent_store && chown -R appuser:appuser /app/project/parent_store
+
+USER appuser
+
+EXPOSE 8000
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

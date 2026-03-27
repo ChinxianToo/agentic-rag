@@ -13,7 +13,10 @@ class VectorDbManager:
             self.__client = QdrantClient(url=config.QDRANT_URL)
         else:
             self.__client = QdrantClient(path=config.QDRANT_DB_PATH)
-        self.__dense_embeddings = OllamaEmbeddings(model=config.DENSE_MODEL)
+        self.__dense_embeddings = OllamaEmbeddings(
+            model=config.DENSE_MODEL,
+            base_url=config.OLLAMA_BASE_URL,
+        )
         self.__sparse_embeddings = FastEmbedSparse(model_name=config.SPARSE_MODEL)
 
     def create_collection(self, collection_name):

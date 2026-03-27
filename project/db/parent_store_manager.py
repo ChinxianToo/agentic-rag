@@ -47,6 +47,15 @@ class ParentStoreManager:
         return [self.load_content(pid) for pid in sorted(unique_ids, key=self._get_sort_key)]
     
     def clear_store(self) -> None:
+        """Delete all files inside the store directory without removing the directory itself.
+
+        Deleting the directory root fails when it is a Docker volume mount point
+        (OSError: Device or resource busy), so we clear contents instead.
+        """
         if self.__store_path.exists():
-            shutil.rmtree(self.__store_path)
+            for item in self.__store_path.iterdir():
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item)
         self.__store_path.mkdir(parents=True, exist_ok=True)

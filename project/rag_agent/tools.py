@@ -1,9 +1,34 @@
+import json
+import logging
 import re
-from typing import List
+from typing import Any, List
 
 import config
 from langchain_core.tools import tool
 from db.parent_store_manager import ParentStoreManager
+
+# MCP tool functions — imported from the FastMCP server so the same logic
+# is used whether called by the LangGraph agent (LangChain wrapper) or an
+# external MCP client talking to the standalone mcp_server.py process.
+from mcp_server import export_cpi_data as _mcp_export_cpi_data
+from mcp_server import log_summary as _mcp_log_summary
+
+_tools_log = logging.getLogger("cpi_rag.tools")
+
+
+def _log_tool_line(event: str, tool: str, payload: dict[str, Any]) -> None:
+    row = {"event": event, "tool": tool, **payload}
+    _tools_log.info("%s", json.dumps(row, ensure_ascii=False, default=str))
+
+
+def _search_outcome_meta(text: str) -> dict[str, Any]:
+    if "RETRIEVAL_ERROR" in text[:80]:
+        return {"result": "retrieval_error"}
+    if "RETRIEVAL_STATUS:OK" in text:
+        return {"result": "ok"}
+    if "LOW_CONFIDENCE" in text or "NO_RELEVANT_CHUNKS" in text:
+        return {"result": "low_confidence_or_empty"}
+    return {"result": "other"}
 
 
 def _query_lexically_overlaps_doc(query: str, doc_text: str) -> bool:
@@ -98,28 +123,6 @@ class ToolFactory:
         except Exception as e:
             return f"RETRIEVAL_ERROR: {str(e)}"
 
-    def _retrieve_many_parent_chunks(self, parent_ids: List[str]) -> str:
-        """Retrieve full parent chunks by their IDs.
-
-        Args:
-            parent_ids: List of parent chunk IDs to retrieve
-        """
-        try:
-            ids = [parent_ids] if isinstance(parent_ids, str) else list(parent_ids)
-            raw_parents = self.parent_store_manager.load_content_many(ids)
-            if not raw_parents:
-                return "NO_PARENT_DOCUMENTS"
-
-            return "\n\n".join([
-                f"Parent ID: {doc.get('parent_id', 'n/a')}\n"
-                f"File Name: {doc.get('metadata', {}).get('source', 'unknown')}\n"
-                f"Content: {doc.get('content', '').strip()}"
-                for doc in raw_parents
-            ])
-
-        except Exception as e:
-            return f"PARENT_RETRIEVAL_ERROR: {str(e)}"
-
     def _retrieve_parent_chunks(self, parent_id: str) -> str:
         """Retrieve full parent chunk by ID (full division time series when ingested from CPI CSV).
 
@@ -144,9 +147,105 @@ class ToolFactory:
         except Exception as e:
             return f"PARENT_RETRIEVAL_ERROR: {str(e)}"
 
-    def create_tools(self) -> List:
-        """Create and return the list of tools."""
-        search_tool = tool("search_child_chunks")(self._search_child_chunks)
-        retrieve_tool = tool("retrieve_parent_chunks")(self._retrieve_parent_chunks)
+    # ── MCP Tool wrappers ─────────────────────────────────────────────────────
 
-        return [search_tool, retrieve_tool]
+    def _export_cpi_data(self, start_year: int, end_year: int, division: str = "overall") -> str:
+        """Malaysia annual CPI for a year range and division (JSON with **csv_content** for download).
+
+        **Use this tool** when the user says export, download, CSV, spreadsheet, or wants the full table.
+        **Do not** use search_child_chunks for the same export request. Education → division "10", transport → "07".
+
+        Args:
+            start_year: First year of the range (1960–2025).
+            end_year:   Last year of the range (1960–2025, must be >= start_year).
+            division:   "overall" (default) — headline CPI only. Use when no division is mentioned.
+                        "all" — all divisions (overall + 01 to 13). Use ONLY when the user
+                                explicitly says "all divisions", "by division", or "breakdown".
+                        "01" to "13" — single COICOP category (food → "01", education → "10").
+
+        Returns:
+            JSON string with records, csv_content (4 d.p.), and source metadata.
+        """
+        return _mcp_export_cpi_data(
+            start_year=int(start_year),
+            end_year=int(end_year),
+            division=str(division),
+        )
+
+    def _log_summary(self, query: str, answer: str, sources: str = "") -> str:
+        """Append a Q&A interaction to the audit log for monitoring and evaluation.
+
+        Call this after delivering an answer to record the interaction.
+
+        Args:
+            query:   The user's original question.
+            answer:  The answer text (first 500 chars stored).
+            sources: Comma-separated source filenames cited (optional).
+        """
+        return _mcp_log_summary(query=query, answer=answer, sources=sources)
+
+    def create_tools(self) -> List:
+        """Create and return the list of tools (RAG + MCP export).
+
+        log_summary is intentionally excluded here — it is called from the API
+        layer after the agent finishes so it never mid-conversation-loops the agent.
+
+        Each tool is wrapped to emit stdlib ``logging`` lines (logger ``cpi_rag.tools``):
+        ``invoke`` before the body runs, ``complete`` after (visible in ``docker logs`` when
+        the API has configured root/basic logging).
+        """
+
+        def search_child_chunks(query: str, limit: int) -> str:
+            _log_tool_line("invoke", "search_child_chunks", {"query": (query or "")[:500], "limit": limit})
+            out = self._search_child_chunks(query, limit)
+            meta = _search_outcome_meta(out)
+            meta["output_chars"] = len(out or "")
+            _log_tool_line("complete", "search_child_chunks", meta)
+            return out
+
+        def retrieve_parent_chunks(parent_id: str) -> str:
+            _log_tool_line("invoke", "retrieve_parent_chunks", {"parent_id": (parent_id or "")[:200]})
+            out = self._retrieve_parent_chunks(parent_id)
+            ok = "<<<PARENT_RETRIEVAL:OK>>>" in (out or "")
+            err = (out or "").startswith("PARENT_RETRIEVAL_ERROR")
+            _log_tool_line(
+                "complete",
+                "retrieve_parent_chunks",
+                {
+                    "result": "ok" if ok else ("error" if err else "not_found_or_other"),
+                    "output_chars": len(out or ""),
+                },
+            )
+            return out
+
+        def export_cpi_data(start_year: int, end_year: int, division: str = "overall") -> str:
+            _log_tool_line(
+                "invoke",
+                "export_cpi_data",
+                {"start_year": int(start_year), "end_year": int(end_year), "division": str(division)},
+            )
+            out = self._export_cpi_data(start_year, end_year, division)
+            extra: dict[str, Any] = {"output_chars": len(out or "")}
+            try:
+                parsed = json.loads(out)
+                if "error" in parsed:
+                    extra["result"] = "error"
+                    extra["error"] = str(parsed.get("error", ""))[:300]
+                else:
+                    extra["result"] = "ok"
+                    extra["record_count"] = parsed.get("record_count")
+                    extra["division"] = parsed.get("division")
+            except Exception:
+                extra["result"] = "parse_error"
+            _log_tool_line("complete", "export_cpi_data", extra)
+            return out
+
+        search_child_chunks.__doc__ = self._search_child_chunks.__doc__
+        retrieve_parent_chunks.__doc__ = self._retrieve_parent_chunks.__doc__
+        export_cpi_data.__doc__ = self._export_cpi_data.__doc__
+
+        search_tool = tool("search_child_chunks")(search_child_chunks)
+        retrieve_tool = tool("retrieve_parent_chunks")(retrieve_parent_chunks)
+        export_tool = tool("export_cpi_data")(export_cpi_data)
+
+        return [search_tool, retrieve_tool, export_tool]

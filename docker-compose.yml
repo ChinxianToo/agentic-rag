@@ -1,0 +1,89 @@
+name: cpi-rag
+
+services:
+
+  # ── Qdrant vector database ──────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: cpi-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  # ── Ollama — local embedding model ─────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cpi-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    # Uncomment for NVIDIA GPU acceleration:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+  # ── CPI MCP Server (FastMCP — standalone MCP endpoint for external clients) ─
+  mcp-server:
+    build:
+      context: .
+      dockerfile: project/Dockerfile
+    container_name: cpi-mcp-server
+    ports:
+      - "8001:8001"
+    env_file:
+      - project/.env
+    environment:
+      QDRANT_URL:      http://qdrant:6333
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - parent_store:/app/project/parent_store
+      - ./project/data:/app/project/data:ro
+    depends_on:
+      - qdrant
+    command: ["python", "project/mcp_server.py", "--port", "8001"]
+    restart: unless-stopped
+
+  # ── CPI RAG API ─────────────────────────────────────────────────────────────
+  rag-api:
+    build:
+      context: .               # repo root (has requirements.txt + project/)
+      dockerfile: project/Dockerfile
+    container_name: cpi-rag-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - project/.env           # OPENROUTER_API_KEY
+    environment:
+      # Point to Docker service names instead of localhost
+      QDRANT_URL:       http://qdrant:6333
+      OLLAMA_BASE_URL:  http://ollama:11434
+      # Agent step trace → project/logs/agent_steps.jsonl (file). For docker logs -f, also set:
+      # AGENT_TRACE_STDOUT: "1"
+      # Optional overrides (defaults match config.py)
+      # LLM_MODEL:      google/gemini-2.5-flash-lite
+      # DENSE_MODEL:    nomic-embed-text
+      API_PORT: "8000"
+    volumes:
+      # Persist generated parent-store JSON files across restarts
+      - parent_store:/app/project/parent_store
+      # Mount your CPI CSV from the host (read-only)
+      # Place file at:  ./project/data/cpi_2d_annual.csv
+      - ./project/data:/app/project/data:ro
+    depends_on:
+      - qdrant
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  ollama_models:
+  parent_store:
