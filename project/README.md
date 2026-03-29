@@ -1,597 +1,200 @@
-# Agentic RAG System Documentation
+# CPI Agentic RAG — Project README
 
-An **Agentic Retrieval-Augmented Generation (RAG)** system built with **LangGraph**, featuring **parent–child chunking**, **hybrid dense + sparse retrieval**, and **multi-LLM provider support**.
-
-
-## Table of Contents
-
-[Quick Start](#quick-start) | [Architecture Overview](#architecture-overview) | [Project Structure](#project-structure) | [Configuration Guide](#configuration-guide) | [Common Customizations](#common-customizations) | [Advanced Topics](#advanced-topics) | [Troubleshooting](#troubleshooting)
+LangGraph agent over **Malaysia annual CPI** (DOSM / OpenDOSM): hybrid retrieval in **Qdrant**, local **Ollama** embeddings, **OpenRouter** chat models, optional **MCP** export tools.
 
 ---
 
-## Quick Start
+## Table of contents
 
-### Installation
+1. [Quickstart (≤10 min)](#quickstart-10-min)  
+2. [Tool choice & model provider](#tool-choice--model-provider)  
+3. [Data card](#data-card)  
+4. [RAG design](#rag-design-chunking-embeddings-k)  
+5. [Eval methodology & results](#eval-methodology--results)  
+6. [Limitations & future work](#limitations--future-work)  
 
-Install all required dependencies:
+---
+
+## Quickstart (≤10 min)
+
+**You need:** Docker (Compose v2), an **OpenRouter** account + key, and ~10 minutes for first-time image build and model pull.
+
+### 1. API key (redacted in docs)
+
+Create `project/.env`:
 
 ```bash
-pip install -r requirements.txt
+# Required for the chat LLM (OpenRouter). Do not commit real keys.
+OPENROUTER_API_KEY=<your_openrouter_key>
 ```
 
-### Running the Application
+### 2. CPI CSV
 
-Start the Gradio interface locally:
+Place the annual CPI file (long format: `date`, `division`, `index`) at **`project/data/cpi_2d_annual.csv`**.
+
+The Compose stack mounts `./project/data` read-only. The API entrypoint can auto-ingest if the Qdrant collection is empty.
+
+### 3. Run the stack
+
+From the **repository root** (where `docker-compose.yml` lives):
 
 ```bash
-python project/app.py
+docker compose up --build
 ```
 
-The application will be available at `http://localhost:7860` (default Gradio port).
+Wait for:
 
-### Prerequisites
+- Qdrant healthy  
+- Ollama up; **`nomic-embed-text`** pulled (first run)  
+- Optional: one-time CPI ingest into `document_child_chunks`  
+- **rag-api** listening on **8000**
 
-- Python 3.10+
-- Ollama (local) or API keys for OpenAI, Anthropic, or Google
+### 4. Call the API
+
+```bash
+# Streaming chat (SSE)
+curl -sN -X POST http://localhost:8000/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What was overall CPI in 2020?"}'
+
+# Health
+curl -s http://localhost:8000/health
+```
+
+**Local dev (no Docker):** install `requirements.txt`, run **Ollama** + **Qdrant** (or set `QDRANT_URL`), then:
+
+```bash
+cd project && python app.py server
+# or: uvicorn api:app --host 0.0.0.0 --port 8000
+```
 
 ---
 
-## Architecture Overview
+## Tool choice & model provider
 
-This system implements an advanced RAG pipeline with the following key features:
+### Chat model (reasoning & tool calling)
 
-- **Parent-Child Chunking**: Documents are split into small child chunks (for precise retrieval) linked to larger parent chunks (for rich context)
-- **Hybrid Search**: Combines dense embeddings and sparse (BM25) retrieval for optimal results
-- **LangGraph Agent**: Orchestrates query rewriting, retrieval, and response generation
-- **Multi-Provider Support**: Seamlessly switch between Ollama, OpenAI GPT, Google Gemini, and Anthropic Claude
-- **Vector Storage**: Uses Qdrant for efficient similarity search
+| Component | Default | Config |
+|-----------|---------|--------|
+| **Provider** | **OpenRouter** (`langchain_openrouter.ChatOpenRouter`) | `OPENROUTER_API_KEY` in `project/.env` |
+| **Model id** | `openai/gpt-4o-mini` | `LLM_MODEL` in `project/config.py` or env override in Compose |
+| **Temperature** | `0` | `LLM_TEMPERATURE` |
 
-### Data Flow
+Any OpenRouter model string works (e.g. `google/gemini-2.5-flash-lite`). **API keys must never appear in README or commits** — use `.env` only.
 
-```
-PDF → Markdown Conversion → Parent/Child Chunking → Vector Indexing → Agent Retrieval → LLM Response
-```
+### Embeddings (retrieval)
+
+| Component | Default | Config |
+|-----------|---------|--------|
+| **Provider** | **Ollama** | `OLLAMA_BASE_URL` (Docker: `http://ollama:11434`) |
+| **Dense model** | `nomic-embed-text` | `DENSE_MODEL` |
+| **Sparse** | BM25 via FastEmbed | `SPARSE_MODEL` = `Qdrant/bm25`, field `SPARSE_VECTOR_NAME` = `sparse` |
+
+Changing the embedding model requires **re-ingestion** (`ingest_cpi.py --reset`).
+
+### Vector store
+
+| Component | Default | Config |
+|-----------|---------|--------|
+| **Engine** | **Qdrant** | `QDRANT_URL` (e.g. `http://localhost:6333` or embedded path `QDRANT_DB_PATH` if unset) |
+| **Collection** | `document_child_chunks` | `CHILD_COLLECTION` |
+
+### Agent tools (LangGraph)
+
+| Tool | Role |
+|------|------|
+| `search_child_chunks` | Hybrid dense + sparse search over **child** chunks (one CPI row → one chunk). |
+| `retrieve_parent_chunks` | Load full **division time series** from `parent_store` by `parent_id`. |
+| `export_cpi_data` | Read canonical CSV → JSON + `csv_content` (export/download flows); shared with MCP server. |
+
+Structured **query analysis** (rewrite layer) uses Pydantic **`QueryAnalysis`** in `rag_agent/schemas.py`, not the tool args.
 
 ---
 
-## Project Structure
+## Data card
 
-### Entry Point & Configuration
+| Field | Detail |
+|--------|--------|
+| **Source** | DOSM / OpenDOSM **annual** CPI (Malaysia), typically `cpi_annual` / `CPI 2D Annual` style extracts |
+| **Granularity** | One index value per **(year, division)** — **not** monthly |
+| **Year range** | **1960–2025** (as configured in guardrails / prompts; clip to your CSV) |
+| **Divisions** | `overall` (headline) + COICOP-style groups **01–13** (food, transport, education, …) |
+| **On-disk CSV** | Long format: `date`, `division`, `index` (see `cpi_document_builder.py`) |
+| **License / attribution** | Follow OpenDOSM / DOSM terms (export tool JSON includes a **license** string when present) |
+| **PII** | None expected — aggregate statistics only |
 
-| File | Purpose |
+---
+
+## RAG design (chunking, embeddings, k)
+
+### Chunking (tabular CPI)
+
+- **Child (embedded):** **one CSV row → one LangChain `Document`** — natural-language fact + metadata (`division`, `year`, `parent_id`, `source`, …). No sliding overlapping windows on raw CSV.  
+- **Parent (file store):** **one document per `division`**, full annual series as `year: index` lines in `parent_store` JSON, id `cpi_2dannual_{division}_parent`.  
+
+Implementation: `cpi_document_builder.py` + `ingest_cpi.py`.
+
+### Retrieval mode
+
+- **Hybrid:** `QdrantVectorStore` with `RetrievalMode.HYBRID` (`langchain_qdrant`): dense cosine + sparse BM25.
+
+### Effective *k* and thresholds
+
+| Setting | Role | Default (`config.py`) |
+|---------|------|------------------------|
+| Tool `limit` | Max chunks returned to the LLM (agent-chosen, capped in tool) | Up to **15** in code |
+| `SEARCH_TOP_K_DEFAULT` | Fetch size before filtering | **7** |
+| `RETRIEVAL_SCORE_THRESHOLD` | Min score to keep in the result list | **0.22** |
+| `RETRIEVAL_MIN_TOP_SCORE` | Below best score → **low_confidence** path | **0.30** |
+| `RETRIEVAL_LEXICAL_OVERLAP_CHECK` | Extra guard on hybrid false positives | **True** |
+
+Tune these if you see empty hits or noisy matches for your index size and embedding model.
+
+### Memory & compression
+
+- Outer graph: conversation summary + query rewrite; checkpointed threads (`InMemorySaver` — lost on API restart unless changed).  
+- Inner agent: token estimate → optional **compress_context** summarization; limits `MAX_TOOL_CALLS` / `MAX_ITERATIONS`.
+
+---
+
+## Eval methodology & results
+
+**There is no fixed benchmark script in this repo.** Suggested lightweight methodology:
+
+1. **Gold Q&A set:** Curate ~20–50 questions with answers computed from the CSV (exact division/year index).  
+2. **Metrics:** Exact match or tolerance on numeric CPI; optional citation match (`division`, `year`, source file).  
+3. **Runs:** Fix `LLM_MODEL`, embedding model, and ingestion hash; run each question via `POST /v1/chat` or stream.  
+4. **Logging for post-hoc analysis:**  
+   - `project/logs/interactions.jsonl` — `log_summary` (query + answer preview)  
+   - `project/logs/agent_steps.jsonl` — optional LangGraph step trace (`AGENT_TRACE_LOG`)  
+   - Stdlib **JSON logs** from `api.py` (query, `graph_route`, `retrieved_docs`, status) and **`cpi_rag.tools`** (tool invoke/complete)  
+
+**Published results:** N/A in-repo — fill this section after you run your eval set.
+
+---
+
+## Limitations & future work
+
+- **Annual only:** Questions implying monthly CPI cannot be answered from this index.  
+- **National index:** No city- or regional-level CPI in the default dataset card.  
+- **In-memory checkpoints:** Conversation history does not survive `rag-api` container recreation unless you swap in a persistent checkpointer.  
+- **Export vs search:** Export intent is prompt- + orchestrator-gated; edge cases can still mix tools — tighter schemas or deterministic export routing could harden this.  
+- **Eval:** Add automated regression tests + a small public CPI-QA gold file.  
+- **Observability:** Optional OpenTelemetry; structured log shipping from `cpi_rag.tools` + API summaries.  
+- **Multi-collection:** Currently centered on one CPI CSV collection; extending to other DOSM tables would need separate ingest pipelines and tool routing.
+
+---
+
+## Related paths
+
+| Path | Purpose |
 |------|---------|
-| `project/app.py` | Application entry point, launches Gradio UI |
-| `project/config.py` | **Central configuration hub** - edit this for provider/model/chunking changes |
-| `project/utils.py` | PDF to Markdown conversion and context token estimation |
-| `project/document_chunker.py` | Parent/child splitting logic with cleaning and merging rules |
-| `project/cpi_document_builder.py` | CPI CSV → row-level child docs + division-level parent series (tabular chunking) |
-| `project/ingest_cpi.py` | CLI: embed CPI into Qdrant + `parent_store` |
-| `project/Dockerfile` | Dockerfile with Ollama for local deployment |
-
-### Core System
-
-| File | Purpose |
-|------|---------|
-| `project/core/rag_system.py` | System bootstrap - creates managers and compiles LangGraph agent |
-| `project/core/document_manager.py` | Document ingestion pipeline (convert, chunk, index) |
-| `project/core/chat_interface.py` | Thin wrapper for agent graph interaction |
-
-### Database Layer
-
-| File | Purpose |
-|------|---------|
-| `project/db/vector_db_manager.py` | Qdrant client wrapper with embedding initialization |
-| `project/db/parent_store_manager.py` | File-backed storage for parent chunks |
-
-### RAG Agent (LangGraph)
-
-| File | Purpose |
-|------|---------|
-| `project/rag_agent/graph.py` | Graph builder and compilation logic |
-| `project/rag_agent/graph_state.py` | Shared and per-agent graph state definitions and answer accumulation/reset logic|
-| `project/rag_agent/nodes.py` | Node implementations (summarize, rewrite, agent execution, aggregate) |
-| `project/rag_agent/edges.py` | Conditional edge routing logic (e.g., routing based on query clarity) |
-| `project/rag_agent/tools.py` | Retrieval tools (`search_child_chunks`, `retrieve_parent_chunks`) |
-| `project/rag_agent/prompts.py` | System prompts for agent behavior |
-| `project/rag_agent/schemas.py` | Structured output schemas (Pydantic models) |
-
-### User Interface
-
-| File | Purpose |
-|------|---------|
-| `project/ui/css.py` | Custom CSS styling for the Gradio interface |
-| `project/ui/gradio_app.py` | Gradio UI implementation with document upload and chat |
+| `docker-compose.yml` | Qdrant, Ollama, `rag-api`, optional `mcp-server` |
+| `project/docker-entrypoint.sh` | Health checks, optional auto-ingest, `uvicorn project.api:app` |
+| `project/api.py` | FastAPI: `/v1/chat`, `/v1/chat/stream`, CSV export routes |
+| `project/mcp_server.py` | Standalone FastMCP CPI tools |
+| `project/API_GATEWAY.md` | Extra API / gateway notes (if present) |
 
 ---
 
-## Configuration Guide
-
-All primary settings are in `project/config.py`. Key parameters:
-
-### Directory Configuration
-
-```python
-MARKDOWN_DIR = "markdown_docs"        # Storage for converted PDF → Markdown files
-PARENT_STORE_PATH = "parent_store"    # File-backed storage for parent chunks
-QDRANT_DB_PATH = "qdrant_db"          # Local Qdrant vector database path
-```
-
-### Qdrant Configuration
-
-```python
-CHILD_COLLECTION = "document_child_chunks"  # Collection name for child chunks
-SPARSE_VECTOR_NAME = "sparse"               # Named sparse vector field (BM25)
-```
-
-### Model Configuration
-
-```python
-# Default: single model configuration
-DENSE_MODEL = "sentence-transformers/all-mpnet-base-v2"
-SPARSE_MODEL = "Qdrant/bm25"
-LLM_MODEL = "qwen3:4b-instruct-2507-q4_K_M"
-LLM_TEMPERATURE = 0  # 0 = deterministic, 1 = creative
-```
-
-### Agent Configuration
-```python
-# Hard limits to prevent infinite loops
-MAX_TOOL_CALLS = 8       # Maximum tool calls per agent run
-MAX_ITERATIONS = 10      # Maximum agent loop iterations
-
-# Context compression thresholds
-BASE_TOKEN_THRESHOLD = 2000     # Initial token threshold for compression
-TOKEN_GROWTH_FACTOR = 0.9       # Multiplier applied after each compression
-```
-
-### Text Splitter Configuration
-
-```python
-CHILD_CHUNK_SIZE = 500              # Size of chunks used for retrieval
-CHILD_CHUNK_OVERLAP = 100           # Overlap between chunks (prevents context loss)
-MIN_PARENT_SIZE = 2000              # Minimum parent chunk size
-MAX_PARENT_SIZE = 4000             # Maximum parent chunk size
-
-# Markdown header splitting strategy
-HEADERS_TO_SPLIT_ON = [
-    ("#", "H1"),
-    ("##", "H2"),
-    ("###", "H3")
-]
-```
-
-### DOSM CPI (tabular) — ingestion & chunking
-
-For **`parent_store/CPI 2D Annual.csv`** (and similar long-format CPI tables), **do not** run the Markdown parent/child splitter on raw CSV text: fixed-size recursive splits break rows and mix unrelated years/divisions.
-
-**Recommended strategy (implemented in `cpi_document_builder.py`):**
-
-| Piece | Strategy |
-|--------|----------|
-| **Child chunks (embedded)** | **One CSV row → one document.** Each row is turned into a short **natural-language fact** (division, year, index) so dense + BM25 retrieval can match questions like “CPI for food in 2010”. |
-| **Parent chunks (parent_store)** | **One document per `division`** (including `overall`): the **full available annual series** for that division as `year: index` lines, for `retrieve_parent_chunks` when the agent needs trend context. |
-| **Overlap / window** | **None** at row level (each row is atomic). Series context is in the **parent**, not overlapping windows. |
-| **Embeddings** | Same as the rest of the app: **`DENSE_MODEL`** in `config.py` (default **Ollama `nomic-embed-text`**). Changing the embedding model requires re-running ingestion. |
-| **Vector store** | **Qdrant** hybrid (`QdrantVectorStore` + `FastEmbedSparse`), collection `CHILD_COLLECTION`. |
-| **Retrieval `k`** | Set in the agent tool call (default in `search_child_chunks`); treat **5–10** as a reasonable starting range for CPI Q&A. |
-
-**Run ingestion (clean index):**
-
-```bash
-# From repo root (requires Ollama + embedding model, and Qdrant per config)
-python project/ingest_cpi.py --reset
-```
-
-`--reset` deletes the configured Qdrant collection, recreates it, **clears `parent_store`**, then indexes CPI. Back up `parent_store` first if it contains non-CPI parents.
-
-**CSV location:** `parent_store/` is **gitignored**, so a fresh clone has no CSV until you add one. Put the file at `project/parent_store/CPI 2D Annual.csv`, or **`project/data/cpi_2d_annual.csv`** (tracked if you commit it), or pass `--csv /path/to/file.csv`. The ingest script resolves the first path that exists.
-
-### Phase 3 — RAG answers, citations, low-confidence (LangGraph)
-
-- **Retrieval:** `search_child_chunks` uses `similarity_search_with_relevance_scores`, returns **`<<<RETRIEVAL_STATUS:OK|top_score=...>>>`** plus numbered lines with **relevance**, **source**, **division**, **year**, **parent_id**, and **Content** for inline citations.
-- **Answering:** Orchestrator / fallback prompts require **inline citations** (file, division, year, `[n]`) and a final **Sources** list (including `.csv`).
-- **Low confidence:** If there are no hits, **top similarity** is below `RETRIEVAL_MIN_TOP_SCORE`, or (when `RETRIEVAL_LEXICAL_OVERLAP_CHECK` is on) the query has **no lexical overlap** with the top hit, the subgraph routes **`tools` → `retrieval_guard` → `low_confidence_response` → `collect_answer`** instead of looping compression/orchestrator — clarifying question or polite refusal via `get_low_confidence_prompt()`.
-- **Tune:** `RETRIEVAL_MIN_TOP_SCORE`, `RETRIEVAL_SCORE_THRESHOLD`, `RETRIEVAL_LEXICAL_OVERLAP_CHECK` in `project/config.py`.
-
----
-
-## Common Customizations
-
-### 1. Switching LLM Provider (Single Provider)
-
-> **Performance Note:** LLMs with 7B+ parameters typically offer superior reasoning, context comprehension, and response quality compared to smaller models. This applies to both proprietary and open-source models, as long as they **support native tool/function calling,** which is required for agentic RAG workflows.
-
-If you want to permanently switch from one provider to another (e.g., Ollama → Google Gemini), follow this steps:
-
-**Step 1:** Install the provider's SDK
-
-```bash
-pip install langchain-google-genai
-```
-
-**Step 2:** Set environment variable
-
-```bash
-export GOOGLE_API_KEY="your-google-key"
-```
-
-**Step 3:** Update `project/config.py`
-
-```python
-LLM_MODEL = "gemini-2.5-pro"
-LLM_TEMPERATURE = 0
-```
-
-**Step 4:** Modify `project/core/rag_system.py`
-
-Replace:
-
-```python
-llm = ChatOllama(model=config.LLM_MODEL, temperature=config.LLM_TEMPERATURE)
-```
-
-With:
-
-```python
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-llm = ChatGoogleGenerativeAI(model=config.LLM_MODEL, temperature=config.LLM_TEMPERATURE)
-```
-
-### 2. Multi-Provider Configuration
-
-This approach allows you to maintain multiple provider configurations and switch between them easily.
-
-**Step 1:** Install required SDKs
-
-```bash
-pip install langchain-openai langchain-anthropic langchain-google-genai
-```
-
-**Step 2:** Set environment variables
-
-```bash
-export OPENAI_API_KEY="your-openai-key"
-export ANTHROPIC_API_KEY="your-anthropic-key"
-export GOOGLE_API_KEY="your-google-key"
-```
-
-**Step 3:** Update `project/config.py` with multi-provider configuration
-
-```python
-# --- Multi-Provider LLM Configuration ---
-LLM_CONFIGS = {
-    "ollama": {
-        "model": "ministral-3:14b-instruct-2512-q4_K_M",
-        "url":"http://localhost:11434",
-        "temperature": 0
-    },
-    "openai": {
-        "model": "gpt-5.2",
-        "temperature": 0
-    },
-    "anthropic": {
-        "model": "claude-sonnet-4-6",
-        "temperature": 0
-    },
-    "google": {
-        "model": "gemini-2.5-flash",
-        "temperature": 0
-    }
-}
-
-# Switch providers by changing this single line
-ACTIVE_LLM_CONFIG = "ollama"
-```
-
-**Step 4:** Modify `project/core/rag_system.py` in the `initialize()` method
-
-Replace the existing LLM initialization with:
-
-```python
-def initialize(self):
-    self.vector_db.create_collection(self.collection_name)
-    collection = self.vector_db.get_collection(self.collection_name)
-    
-    # Load active configuration
-    active_config = config.LLM_CONFIGS[config.ACTIVE_LLM_CONFIG]
-    model = active_config["model"]
-    temperature = active_config["temperature"]
-    
-    if config.ACTIVE_LLM_CONFIG == "ollama":
-        from langchain_ollama import ChatOllama
-        llm = ChatOllama(model=model, temperature=temperature, base_url=active_config["url"])
-        
-    elif config.ACTIVE_LLM_CONFIG == "openai":
-        from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(model=model, temperature=temperature)
-        
-    elif config.ACTIVE_LLM_CONFIG == "anthropic":
-        from langchain_anthropic import ChatAnthropic
-        llm = ChatAnthropic(model=model, temperature=temperature)
-        
-    elif config.ACTIVE_LLM_CONFIG == "google":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        llm = ChatGoogleGenerativeAI(model=model, temperature=temperature)
-        
-    else:
-        raise ValueError(f"Unsupported LLM provider: {config.ACTIVE_LLM_CONFIG}")
-    
-    # Continue with tool and graph initialization
-    tools = ToolFactory(collection).create_tools()
-    self.agent_graph = create_agent_graph(llm, tools)
-```
-
-**Switching Providers:** Simply change `ACTIVE_LLM_CONFIG` in `config.py`:
-
-```python
-ACTIVE_LLM_CONFIG = "google"  # Switch to Gemini Pro
-# ACTIVE_LLM_CONFIG = "anthropic"  # Or Claude Sonnet
-# ACTIVE_LLM_CONFIG = "openai"  # Or GPT-4o
-```
-
----
-
-**Provider Reference Table:**
-
-| Provider | Environment Variable | Import Statement | Example Models |
-|----------|---------------------|------------------|----------------|
-| OpenAI | `OPENAI_API_KEY` | `from langchain_openai import ChatOpenAI` | `gpt-5.2`, `ggpt-5-mini` |
-| Anthropic | `ANTHROPIC_API_KEY` | `from langchain_anthropic import ChatAnthropic` | `claude-opus-4-6`, `claude-sonnet-4-6` |
-| Google | `GOOGLE_API_KEY` | `from langchain_google_genai import ChatGoogleGenerativeAI` | `gemini-2.5-pro`, `gemini-2.5-flash` |
-| Ollama | None (local) | `from langchain_ollama import ChatOllama` | `qwen3:4b-instruct-2507-q4_K_M`, `ministral-3:8b-instruct-2512-q4_K_M`, `llama3.1:8b-instruct-q6_K` |
-
----
-
-### 3. Changing Embedding Models
-
-**Why change?** Trade-offs between speed, cost, and quality.
-
-**Step 1:** Update `project/config.py`
-
-```python
-# Example: Faster, smaller model
-DENSE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-# Example: Higher quality, slower model
-# DENSE_MODEL = "sentence-transformers/all-mpnet-base-v2"
-
-# Example: Gemma embeddings (Google's open model)
-# DENSE_MODEL = "google/embeddinggemma-300m"
-
-# Example: Qwen embeddings (Alibaba's multilingual model)
-# DENSE_MODEL = "Qwen/Qwen3-Embedding-8B"
-
-SPARSE_MODEL = "Qdrant/bm25"  # Usually no need to change
-```
-
-**Step 2:** Re-index your documents
-
-⚠️ **Important:** Changing embeddings requires re-indexing all documents through the Gradio UI.
-
-**Implementation Details** (in `project/db/vector_db_manager.py`):
-
-```python
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import FastEmbedSparse
-import config
-
-self.__dense_embeddings = HuggingFaceEmbeddings(model_name=config.DENSE_MODEL)
-self.__sparse_embeddings = FastEmbedSparse(model_name=config.SPARSE_MODEL)
-```
-
-**Popular Embedding Models:**
-
-| Model | Context Size | Vector Dimension | Speed | Quality | Use Case |
-|-------|--------------|------------------|-------|---------|----------|
-| all-MiniLM-L6-v2 | 256 tokens | 384 | Fast | Good | General purpose, quick semantic similarity |
-| all-mpnet-base-v2 | 512 tokens | 768 | Medium | Excellent | High-accuracy semantic search |
-| bge-large-en-v1.5 | 512 tokens | 1024 | Slow | Best | Production-grade retrieval on GPU |
-| google/embeddinggemma-300m | 2048 tokens | 768 | Fast | Very Good | Lightweight, efficient multilingual retrieval |
-| Qwen/Qwen3-Embedding-8B | 32768 tokens | 4096 | Slow | Excellent / SOTA | Large-scale multilingual embeddings, long-context RAG |
-
----
-
-### 4. Adjusting Chunking Strategy
-
-**Why adjust?** Balance between retrieval precision and context richness.
-
-**Step 1:** Update chunk sizes in `project/config.py`
-
-```python
-# For short, factual queries (e.g., technical documentation)
-CHILD_CHUNK_SIZE = 300
-CHILD_CHUNK_OVERLAP = 60
-MIN_PARENT_SIZE = 1500
-MAX_PARENT_SIZE = 8000
-
-# For narrative or contextual queries (e.g., legal documents)
-# CHILD_CHUNK_SIZE = 800
-# CHILD_CHUNK_OVERLAP = 150
-# MIN_PARENT_SIZE = 3000
-# MAX_PARENT_SIZE = 15000
-```
-
-**Step 2 (Optional):** Replace the splitter in `project/document_chunker.py`
-
-**Default (Character-based):**
-```python
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-self.__child_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=config.CHILD_CHUNK_SIZE,
-    chunk_overlap=config.CHILD_CHUNK_OVERLAP
-)
-```
-
-**Alternative (Sentence-aware):**
-```python
-from langchain_text_splitters import SentenceTransformersTokenTextSplitter
-
-self.__child_splitter = SentenceTransformersTokenTextSplitter(
-    chunk_size=config.CHILD_CHUNK_SIZE,
-    chunk_overlap=config.CHILD_CHUNK_OVERLAP
-)
-```
-
-**Step 3:** Re-run ingestion pipeline
-
-Upload documents again through the Gradio interface to apply new chunking.
-
-**Chunking Guidelines:**
-
-> ⚠️ **Disclaimer:** These are empirical guidelines. Optimal sizes depend on:
-> - **Child chunk** → embedding model's context window (e.g. 256 tokens for all-MiniLM-L6-v2, 512 for bge-large-en-v1.5): child size should not exceed it
-> - **Parent chunk** → generative model's context window (e.g. 8K, 32K, 128K tokens): parent must fit within the context sent to the LLM alongside the query
->
-> Always validate values empirically on your own corpus.
-
-| Document Type | Child Size | Parent Size | Reasoning |
-|---------------|-----------|-------------|-----------|
-| Technical Docs | 300-500 | 2000-4000 | Precise lookups, code snippets |
-| Legal Contracts | 600-1000 | 5000-15000 | Context-heavy, definitions |
-| Research Papers | 400-600 | 3000-8000 | Balance of precision and context |
-| FAQs / Knowledge Base | 200-400 | 1500-4000 | Short, focused answers |
-
----
-
-### 5. Agent Configuration
-
-Tune agent behavior in `project/config.py`:
-```python
-# Hard limits to prevent infinite loops
-MAX_TOOL_CALLS = 8       # Maximum tool calls per agent run
-MAX_ITERATIONS = 10      # Maximum agent loop iterations
-
-# Context compression thresholds
-BASE_TOKEN_THRESHOLD = 2000     # Initial token threshold for compression
-TOKEN_GROWTH_FACTOR = 0.9       # Multiplier applied after each compression
-```
-
-| Parameter | Effect |
-|-----------|--------|
-| `MAX_TOOL_CALLS` | Increase for complex queries, decrease to speed up simple ones |
-| `MAX_ITERATIONS` | Controls how many reasoning loops the agent can run |
-| `BASE_TOKEN_THRESHOLD` | Delay compression by increasing this value |
-| `TOKEN_GROWTH_FACTOR` | Lower values compress more aggressively |
-
-## Advanced Topics
-
-### Customizing the RAG Agent
-
-**Location:** `project/rag_agent/`
-
-**Add/Remove Nodes:** Edit `graph.py` and `nodes.py`
-
-Example: Adding a fact-checking node
-```python
-# In nodes.py
-def fact_check_node(state):
-    # Your fact-checking logic
-    return {"fact_checked": True}
-
-# In graph.py
-builder.add_node("fact_check", fact_check_node)
-builder.add_edge("retrieve", "fact_check")
-```
-
-**Modify Conditional Routing:** Edit `edges.py` to change graph flow logic
-
-Example from the system - routing based on query clarity:
-```python
-def route_after_rewrite(state: State) -> Literal["request_clarification", "agent"]:
-    """Routes to human input if question unclear, otherwise processes all rewritten queries"""
-    if not state.get("questionIsClear", False):
-        return "request_clarification"
-    else:
-        # Fan-out: send each rewritten question to parallel processing
-        return [
-            Send("agent", {"question": query, "question_index": idx, "messages": []})
-            for idx, query in enumerate(state["rewrittenQuestions"])
-        ]
-```
-
-This pattern allows the agent to either request clarification from the user or fan-out multiple query variations for parallel retrieval.
-
-**Modify Prompts:** Edit `prompts.py` to change agent behavior and response style
-
-**Add Custom Tools:** Extend `tools.py` with new retrieval strategies or external integrations
-
-### Replacing Storage Backends
-
-**Vector Database:**
-- Default: Local Qdrant
-- Alternatives: Remote Qdrant Cloud, Pinecone, Weaviate
-- Edit: `project/db/vector_db_manager.py`
-
-**Parent Store:**
-- Default: JSON file
-- Alternatives: PostgreSQL, MongoDB, S3
-- Edit: `project/db/parent_store_manager.py`
-
-### Extending the UI
-
-**Location:** `project/ui/gradio_app.py`
-
-Add runtime settings, admin panels, or analytics:
-```python
-with gr.Accordion("Advanced Settings", open=False):
-    provider_dropdown = gr.Dropdown(
-        choices=["openai", "anthropic", "google", "ollama"],
-        label="LLM Provider"
-    )
-```
-
-### Docker Deployment
-
-> ⚠️ **System Requirements**: At least 8GB of RAM allocated to Docker. The default Ollama model needs approximately 3.3GB to run.
-
-#### Build and Run
-```bash
-# Build image
-docker build -t agentic-rag -f project/Dockerfile .
-
-# Run container
-docker run --name rag-assistant -p 7860:7860 agentic-rag
-```
-
-**Optional: GPU acceleration** (NVIDIA only):
-```bash
-docker run --gpus all --name rag-assistant -p 7860:7860 agentic-rag
-```
-
-**Common commands:**
-```bash
-docker stop rag-assistant      # Stop
-docker start rag-assistant     # Restart
-docker logs -f rag-assistant   # View logs
-docker rm -f rag-assistant     # Remove
-```
-
-> ⚠️ **Performance Note**: On Windows/Mac, Docker runs via a Linux VM which may slow down I/O operations like document indexing. LLM inference speed is largely unaffected. On Linux, performance is comparable to running locally.
-
-Once running, open `http://localhost:7860`.
-
-### Performance Optimization
-
-**Tips:**
-- Use GPU-enabled embeddings for large document sets
-- Implement caching for frequently retrieved chunks
-- Tune `top_k` retrieval parameters in tools.py
-- Consider async processing for multi-document ingestion
-- Monitor Qdrant memory usage and tune collection parameters
-
----
-
-## Troubleshooting
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| "Model not found" error | Incorrect model name for provider | Verify `LLM_MODEL` matches provider's API (e.g., `gpt-4o-mini` not `gpt4-mini`) |
-| Low-quality retrieval results | Poor embedding model or chunk configuration | Re-index with better embeddings (e.g., all-mpnet-base-v2) or adjust chunk sizes |
-| Slow response times | Large embedding model or high `top_k` value | Use smaller embedding models (e.g., all-MiniLM-L6-v2) or reduce `top_k` in retrieval tools |
-| API rate limits exceeded | Too many requests to external provider | Add retry logic with exponential backoff or switch to local Ollama models |
-| Out of memory errors | Large document set or embedding model | Use smaller embeddings, reduce batch size, or enable GPU acceleration |
-| Empty retrieval results | Collection not indexed or wrong collection name | Verify documents are uploaded and `CHILD_COLLECTION` name matches in config |
-| Import errors after provider switch | Missing SDK installation | Install required package: `pip install langchain-{provider}` |
-| Inconsistent answers across runs | High temperature setting | Set `LLM_TEMPERATURE = 0` in config for deterministic responses |
+*Last rewritten to match the CPI RAG stack in this repository (LangGraph + Qdrant + Ollama + OpenRouter).*
