@@ -1,0 +1,15 @@
+{"id": "q01", "category": "factual_overall", "query": "What was the overall Malaysia CPI index in 2020?", "expected_note": "From cpi_2d_annual.csv: overall index 2020 ≈ 120.1 (annual, national)."}
+{"id": "q02", "category": "factual_division", "query": "What was the CPI for food and non-alcoholic beverages (division 01) in 2020?", "expected_note": "Division 01, 2020: index ≈ 134.75."}
+{"id": "q03", "category": "factual_division", "query": "What was the transport CPI in Malaysia for the year 2020?", "expected_note": "Transport is COICOP division 07 in this dataset; 2020 index ≈ 102.62."}
+{"id": "q04", "category": "factual_division", "query": "What was the Education division CPI in 2020?", "expected_note": "Education is division 10; 2020 index ≈ 120.90."}
+{"id": "q05", "category": "compare_same_division", "query": "For transport CPI, which was higher: 2024 or 2025?", "expected_note": "Division 07: 2024 ≈ 121.68, 2025 ≈ 122.23 → 2025 slightly higher."}
+{"id": "q06", "category": "compare_same_division", "query": "Compare transport CPI for 1994 versus 2024. Which year had the higher index?", "expected_note": "Division 07: 1994 ≈ 69.00, 2024 ≈ 121.68 → 2024 higher."}
+{"id": "q07", "category": "factual_overall", "query": "What was the headline CPI (all groups overall) in 2000?", "expected_note": "Overall index 2000 ≈ 80.55."}
+{"id": "q08", "category": "factual_division", "query": "What was the CPI for housing, water, electricity, gas and other fuels (division 04) in 2020?", "expected_note": "Division 04, 2020: index ≈ 119.15."}
+{"id": "q09", "category": "factual_division", "query": "What was the health division CPI (06) in 2019?", "expected_note": "Division 06, 2019: index ≈ 122.66."}
+{"id": "q10", "category": "compare_overall", "query": "How did overall CPI compare between 1960 and 2025 — which year had the higher index?", "expected_note": "Overall: 1960 ≈ 21.31, 2025 ≈ 134.63 → 2025 much higher."}
+{"id": "q11", "category": "multi_aspect", "query": "Give overall CPI for 2010 and food division CPI for 2010.", "expected_note": "2010: overall ≈ 100.02; division 01 (food) ≈ 99.99 — both near 100 by construction in this series."}
+{"id": "q12", "category": "export", "query": "Export the CPI data for the Education division for the year 2020 as CSV.", "expected_note": "Should invoke export path/tool for division 10, years including 2020; CSV must row match index ≈ 120.90 for 2020."}
+{"id": "q13", "category": "guardrail_offtopic", "query": "What is the weather like in Kuala Lumpur today?", "expected_note": "Pre-graph guardrail: blocked_offtopic; refusal — no LLM weather answer."}
+{"id": "q14", "category": "guardrail_year_range", "query": "What was Malaysia overall CPI in 1950?", "expected_note": "Pre-graph guardrail: blocked_year; dataset range 1960–2025, 1950 out of scope."}
+{"id": "q15", "category": "structure_impossible", "query": "What was Malaysia CPI by city for Kuala Lumpur in 2020?", "expected_note": "Annual 2D extract is national; no city/KL series — expect honest limitation or clarify geography not in index."}

@@ -139,13 +139,53 @@ class ChatResponse(BaseModel):
     reply: str
     thread_id: str
     guardrail_status: str
+    #: Count of child chunks surfaced from search_child_chunks this turn (0 if blocked / no search).
+    retrieved_docs: int = 0
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
 
+
+def _llm_error_detail(exc: BaseException) -> str:
+    """Surface OpenRouter auth failures with an actionable hint (raw message preserved)."""
+    msg = str(exc).strip()
+    if "user not found" in msg.lower():
+        return (
+            f"{msg} — OpenRouter usually returns this for an invalid/revoked key or bad "
+            "`Authorization` (check OPENROUTER_API_KEY in project/.env, no extra spaces; "
+            "verify at https://openrouter.ai/settings/keys ; restart or rebuild rag-api)."
+        )
+    return msg
+
+
 def _sse(event_type: str, payload: dict) -> str:
     """Single SSE line (double-newline terminated)."""
     return f"data: {json.dumps({'event': event_type, **payload})}\n\n"
+
+
+def _normalize_message_content(content: Any) -> str:
+    """LangChain v1 may return multimodal list blocks; sync/stream paths must concatenate str only."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                t = block.get("text")
+                if t is not None:
+                    parts.append(str(t))
+                else:
+                    c = block.get("content")
+                    if c is not None:
+                        parts.append(_normalize_message_content(c))
+            else:
+                parts.append(str(block))
+        return "".join(parts)
+    return str(content)
 
 
 def _count_retrieved_docs_from_search_output(content: str) -> int:
@@ -275,7 +315,7 @@ def _handle_graph_event(event: dict, accum: _RunAccum, *, emit_sse: bool) -> lis
 
     elif ev_type == "on_chat_model_stream" and node in _ANSWER_NODES:
         chunk = event["data"].get("chunk")
-        content = (getattr(chunk, "content", None) or "")
+        content = _normalize_message_content(getattr(chunk, "content", None))
         if content:
             accum.token_count += 1
             accum.full_answer += content
@@ -290,9 +330,10 @@ def _finalize_graph_run(rag: RAGSystem, config: dict, accum: _RunAccum, *, emit_
     out: list[str] = []
     if accum.token_count == 0:
         state = rag.agent_graph.get_state(config)
-        msgs = state.values.get("messages", [])
+        vals = state.values or {}
+        msgs = vals.get("messages", [])
         if msgs:
-            full = getattr(msgs[-1], "content", "") or ""
+            full = _normalize_message_content(getattr(msgs[-1], "content", None))
             if full:
                 accum.full_answer = full
                 if emit_sse:
@@ -367,16 +408,17 @@ async def _event_stream(rag: RAGSystem, message: str, thread_id: str) -> AsyncIt
 
     except Exception as exc:
         logger.exception("Stream error — thread_id={}", thread_id)
+        detail = _llm_error_detail(exc)
         _log_chat_request_summary(
             query=message,
             response="",
             retrieved_docs=getattr(accum, "retrieved_docs", 0),
             status="error",
             thread_id=thread_id,
-            error=str(exc),
+            error=detail,
             graph_route=list(getattr(accum, "graph_route", [])),
         )
-        yield _sse("error", {"message": str(exc)})
+        yield _sse("error", {"message": detail})
         yield "data: [DONE]\n\n"
 
 
@@ -436,7 +478,12 @@ async def chat_sync(req: ChatRequest):
             guardrail_status=status,
             graph_route=[],
         )
-        return ChatResponse(reply=blocking_msg, thread_id=thread_id, guardrail_status=status)
+        return ChatResponse(
+            reply=blocking_msg,
+            thread_id=thread_id,
+            guardrail_status=status,
+            retrieved_docs=0,
+        )
 
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
     input_data = {"messages": [HumanMessage(content=req.message.strip())]}
@@ -451,8 +498,10 @@ async def chat_sync(req: ChatRequest):
         for _ in _finalize_graph_run(rag, config, accum, emit_sse=False):
             pass
 
+        reply_text = accum.full_answer
+
         try:
-            _log_summary(query=req.message, answer=accum.full_answer, sources="CPI 2D Annual.csv")
+            _log_summary(query=req.message, answer=reply_text, sources="CPI 2D Annual.csv")
         except Exception:
             pass
 
@@ -460,7 +509,7 @@ async def chat_sync(req: ChatRequest):
         g_stat = (state.values or {}).get("guardrail_status", "passed")
         _log_chat_request_summary(
             query=req.message,
-            response=accum.full_answer,
+            response=reply_text,
             retrieved_docs=accum.retrieved_docs,
             status="success",
             thread_id=thread_id,
@@ -468,22 +517,24 @@ async def chat_sync(req: ChatRequest):
             graph_route=list(accum.graph_route),
         )
         return ChatResponse(
-            reply=accum.full_answer,
+            reply=reply_text,
             thread_id=thread_id,
             guardrail_status=g_stat if isinstance(g_stat, str) else "passed",
+            retrieved_docs=accum.retrieved_docs,
         )
     except Exception as exc:
         logger.exception("Sync chat error — thread_id={}", thread_id)
+        detail = _llm_error_detail(exc)
         _log_chat_request_summary(
             query=req.message,
             response="",
             retrieved_docs=getattr(accum, "retrieved_docs", 0),
             status="error",
             thread_id=thread_id,
-            error=str(exc),
+            error=detail,
             graph_route=list(getattr(accum, "graph_route", [])),
         )
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @app.delete(

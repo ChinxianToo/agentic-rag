@@ -1,6 +1,19 @@
 import glob
 import os
 
+
+def _env_stripped(*keys: str) -> str | None:
+    """First env value that is non-empty after stripping whitespace, else None."""
+    for key in keys:
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        val = raw.strip()
+        if val:
+            return val
+    return None
+
+
 # --- Directory Configuration ---
 _BASE_DIR = os.path.dirname(__file__)
 
@@ -47,7 +60,13 @@ SPARSE_MODEL = "Qdrant/bm25"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # --- LLM (via OpenRouter) ---
-# Get key from https://openrouter.ai/settings/keys → set OPENROUTER_API_KEY env var
+# Keys: https://openrouter.ai/settings/keys — set OPENROUTER_API_KEY in project/.env
+# (optional alias OPENROUTER_KEY). Trim avoids 401 / "User not found" from stray spaces.
+# Optional: OPENROUTER_APP_URL, OPENROUTER_APP_TITLE (attribution), OPENROUTER_API_BASE.
+OPENROUTER_API_KEY = _env_stripped("OPENROUTER_API_KEY", "OPENROUTER_KEY")
+OPENROUTER_APP_URL = _env_stripped("OPENROUTER_APP_URL")
+OPENROUTER_APP_TITLE = _env_stripped("OPENROUTER_APP_TITLE")
+OPENROUTER_API_BASE = _env_stripped("OPENROUTER_API_BASE", "OPENROUTER_BASE_URL")
 # Format: "provider/model-name"  e.g. openai/gpt-4o-mini, anthropic/claude-3.5-sonnet
 LLM_MODEL = "openai/gpt-4o-mini"
 LLM_TEMPERATURE = 0

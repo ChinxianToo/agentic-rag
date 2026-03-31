@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-03-30T02:40:29.366056+00:00",
+  "n_queries": 15,
+  "n_request_errors": 0,
+  "latency_ms": {
+    "p50": 6695.33,
+    "p95": 10461.73,
+    "n": 15,
+    "definition": "Round-trip /v1/chat from client (includes HTTP errors that returned a body)"
+  },
+  "retrieval": {
+    "eligible_turns": 13,
+    "hits": 11,
+    "hit_rate": 0.8462,
+    "definition": "share of successful responses with guardrail_status==passed and retrieved_docs>0"
+  },
+  "hallucination": {
+    "method": "numeric_rubric_on_expected_note_plus_guardrail_compliance",
+    "numeric_scored": 12,
+    "numeric_flagged": 0,
+    "guardrail_scored": 2,
+    "guardrail_flagged": 0,
+    "denominator": 14,
+    "flagged_total": 0,
+    "rate": 0.0,
+    "skipped_categories_note": "structure_impossible and rows without decimal refs in expected_note are not scored numerically"
+  }
+}

@@ -80,8 +80,6 @@ cd project && python app.py server
 | **Model id** | `openai/gpt-4o-mini` | `LLM_MODEL` in `project/config.py` or env override in Compose |
 | **Temperature** | `0` | `LLM_TEMPERATURE` |
 
-Any OpenRouter model string works (e.g. `google/gemini-2.5-flash-lite`). **API keys must never appear in README or commits** — use `.env` only.
-
 ### Embeddings (retrieval)
 
 | Component | Default | Config |
